@@ -1,1 +1,192 @@
+name: Trivia Enrichment
 
+# Free external scheduler for TheDeathsArchive's background trivia enrichment worker.
+#
+# The worker lives in Base44 (backend function `triviaWorker`) and owns everything stateful:
+# the archive cursor, the 330-second stale-lock ceiling, the 90-second minimum gap, the retry
+# queue, duplicate rejection and every validation rule. This workflow only knocks on its door,
+# so nothing here keeps a cursor of its own.
+#
+# It costs nothing: no AI, no paid API, no Base44 integration credit. The endpoint answers
+# "credits_used": 0 on every call.
+#
+# Behaviour of the endpoint, relied on below:
+#   200 {ok:true, this_tick:{...}}      a batch ran
+#   200 {ok:true, skipped:"recent"}     called within the worker's 90-second minimum gap: no-op
+#   200 {ok:true, skipped:"busy"}       another tick holds the worker lock: no-op
+#   200 {ok:true, skipped:"off"}        worker paused in the admin panel: no-op
+#   401 / 403                           the token is wrong: a real failure
+#   4xx / 5xx / no answer                a real failure (transient ones are retried)
+
+on:
+  schedule:
+    # Every five minutes, UTC. GitHub may start scheduled runs several minutes late, and it
+    # disables schedules in a repository with no activity for 60 days.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# One call at a time. A run that arrives while another is still going waits its turn in the
+# queue instead of starting a second call; the worker's own lock and 90-second gap are the
+# second and third layers, and they are what actually prevent duplicate work.
+concurrency:
+  group: trivia-enrichment
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  tick:
+    name: One enrichment batch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Call the enrichment worker
+        env:
+          WORKER_URL: "https://the-deaths-archive.base44.app/functions/triviaWorker"
+          # Read from the repository secret only. Sent as a header, never in the URL, and never
+          # printed: no step enables shell tracing, and no log line contains it.
+          WORKER_SECRET: ${{ secrets.TDA_TRIVIA_WORKER_SECRET }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${WORKER_SECRET:-}" ]; then
+            echo "::error::The repository secret TDA_TRIVIA_WORKER_SECRET is not set."
+            exit 1
+          fi
+
+          # Only these non-sensitive fields are ever kept or logged; the raw body is discarded.
+          keep_fields='{
+            ok: (.ok == true),
+            skipped: (.skipped // null),
+            error: (if (.error | type) == "string" then (.error | .[0:200]) else null end),
+            examined: (.this_tick.examined // null),
+            enriched: (.this_tick.written // null),
+            questions: (.this_tick.questions // null),
+            retried: (.this_tick.retried // null),
+            already_have: (.this_tick.skipped_with_questions // null),
+            too_few_facts: (.this_tick.insufficient // null),
+            source_failures: (.this_tick.failed // null),
+            not_person: (.this_tick.non_person // null),
+            credits: (.credits_used // null),
+            pass_complete: (.pass_complete // null)
+          }'
+
+          attempt=1
+          max_attempts=3
+          http_status=000
+          result=""
+          started=$SECONDS
+          deadline=420   # stop retrying after seven minutes, well inside the job timeout
+          note=""
+
+          while [ "$attempt" -le "$max_attempts" ]; do
+            body="$(mktemp)"
+            http_status=$(curl --silent --show-error \
+              --output "$body" \
+              --write-out '%{http_code}' \
+              --max-time 200 \
+              --request POST \
+              --header "x-worker-token: ${WORKER_SECRET}" \
+              --header 'Content-Type: application/json' \
+              --data '{"action":"tick"}' \
+              "$WORKER_URL") || http_status=000
+
+            echo "Attempt ${attempt}: HTTP ${http_status}"
+
+            # A body that is not JSON (an HTML error page, say) becomes an empty object, so it
+            # is never echoed into the log.
+            candidate=$(jq -c "${keep_fields}" "$body" 2>/dev/null || printf '{}')
+            rm -f "$body"
+
+            if [ "$http_status" -ge 200 ] && [ "$http_status" -lt 300 ]; then
+              result="$candidate"
+              break
+            fi
+
+            # Transient: no answer, rate limiting, or a server error. A retry is safe — the
+            # worker turns away a second call made while it is still running (skipped: busy)
+            # and one made within 90 seconds of a finished tick (skipped: recent).
+            if [ "$http_status" = "000" ] || [ "$http_status" = "429" ] || [ "$http_status" -ge 500 ]; then
+              result="$candidate"
+              if [ "$attempt" -lt "$max_attempts" ] && [ $((SECONDS - started)) -lt "$deadline" ]; then
+                note="Attempt ${attempt} was transient (HTTP ${http_status}); retried."
+                attempt=$((attempt + 1))
+                sleep $((attempt * 15))
+                continue
+              fi
+              break
+            fi
+
+            # 400 / 401 / 403 and friends are permanent: retrying cannot help.
+            result="$candidate"
+            break
+          done
+
+          if [ -z "$result" ]; then
+            echo "::error::The worker could not be reached (last HTTP ${http_status})."
+            exit 1
+          fi
+
+          f() { jq -r "$1" <<<"$result"; }
+          stamp="$(date -u '+%Y-%m-%d %H:%M:%S')"
+          skipped="$(f '.skipped // empty')"
+          ok="$(f '.ok')"
+          outcome=""
+          icon=""
+
+          if [ "$http_status" -lt 200 ] || [ "$http_status" -ge 300 ]; then
+            case "$http_status" in
+              401|403) hint="Authentication failed: the repository secret does not match the worker's token." ;;
+              400)     hint="The worker rejected the request as invalid." ;;
+              429)     hint="The worker is rate limiting; the batch was not processed." ;;
+              5*)      hint="The worker reported a server error." ;;
+              *)       hint="The worker returned an unexpected status." ;;
+            esac
+            outcome="failed — ${hint}"
+            icon="::error::"
+          elif [ "$ok" != "true" ]; then
+            outcome="failed — the worker did not accept the batch"
+            icon="::error::"
+          elif [ -n "$skipped" ]; then
+            case "$skipped" in
+              recent) outcome="no batch needed — the worker ran within its 90-second minimum gap" ;;
+              busy)   outcome="no batch needed — another tick still holds the worker lock" ;;
+              off)    outcome="no batch needed — the worker is paused in the Trivia admin panel" ;;
+              *)      outcome="no batch needed — the worker declined (${skipped})" ;;
+            esac
+            if [ -n "$note" ]; then
+              outcome="${outcome}; a retry found the earlier call had already completed, so no second batch was started"
+            fi
+            icon="::notice::"
+          else
+            outcome="batch processed"
+            icon="::notice::"
+          fi
+
+          {
+            echo "## Trivia enrichment tick — ${stamp} UTC"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| HTTP status | ${http_status} |"
+            echo "| Outcome | ${outcome} |"
+            echo "| Profiles examined | $(f '.examined // "not returned"') |"
+            echo "| Profiles enriched | $(f '.enriched // "not returned"') |"
+            echo "| Questions created | $(f '.questions // "not returned"') |"
+            echo "| Retry-queue profiles serviced | $(f '.retried // "not returned"') |"
+            echo "| Passed over, already hold questions | $(f '.already_have // "not returned"') |"
+            echo "| Too few facts for a question | $(f '.too_few_facts // "not returned"') |"
+            echo "| Source failures | $(f '.source_failures // "not returned"') |"
+            echo "| Entries that are not people | $(f '.not_person // "not returned"') |"
+            echo "| Credits used | $(f '.credits // "not returned"') |"
+            echo "| Full archive walk completed | $(f '.pass_complete // "not returned"') |"
+            echo "| Worker error | $(f '.error // "none"') |"
+            [ -n "$note" ] && echo "| Retry note | ${note//|/\\|} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "${icon}${outcome} (HTTP ${http_status})"
+
+          if [ "$icon" = "::error::" ]; then
+            exit 1
+          fi
