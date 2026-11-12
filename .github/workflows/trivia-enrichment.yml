@@ -22,7 +22,7 @@ on:
   schedule:
     # Every five minutes, UTC. GitHub may start scheduled runs several minutes late, and it
     # disables schedules in a repository with no activity for 60 days.
-    - cron: "1-59/5 * * * *"
+    # - cron: "1-59/5 * * * *"  --------------- #DISABLED FOR NOW !!! ------------------------
     # run every 5 min
   workflow_dispatch:
 
